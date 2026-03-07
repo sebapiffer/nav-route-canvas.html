@@ -1,0 +1,5 @@
+{
+  "name": "AeroCAD",
+  "description": "Aeronautical CAD for navigation calculations with CLI and parametric drawing.",
+  "requestFramePermissions": []
+}

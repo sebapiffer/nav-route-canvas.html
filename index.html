@@ -1,0 +1,1775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flight Map</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],
+                        mono: ["JetBrains Mono", "ui-monospace", "SFMono-Regular", "monospace"],
+                    },
+                },
+            },
+        }
+    </script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/lucide-react@0.344.0/dist/umd/lucide-react.js"></script>
+    <style>
+        @media print {
+            @page {
+                size: landscape;
+                margin: 0;
+            }
+            body {
+                background-color: white !important;
+                color: black !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                overflow: hidden !important;
+            }
+            .no-print {
+                display: none !important;
+            }
+            .print-only {
+                display: block !important;
+            }
+            .canvas-container {
+                position: fixed !important;
+                top: 0 !important;
+                left: 0 !important;
+                width: 100vw !important;
+                height: 100vh !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: none !important;
+                z-index: 9999 !important;
+                background-color: white !important;
+            }
+            canvas {
+                display: none !important;
+            }
+            img.print-only {
+                width: 100% !important;
+                height: 100% !important;
+                object-fit: contain !important;
+            }
+        }
+
+        .print-only {
+            display: none;
+        }
+
+        /* Hide number input spinners */
+        input[type=number]::-webkit-inner-spin-button, 
+        input[type=number]::-webkit-outer-spin-button { 
+            -webkit-appearance: none; 
+            margin: 0; 
+        }
+
+        input[type=number] {
+            -moz-appearance: textfield;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel" data-presets="typescript,react">
+        const { useState, useEffect, useRef, useCallback } = React;
+        const { MousePointer2, MapPin, Route, Printer, Trash2, Crosshair, Wind, Gauge, Clock, Save, Plane, RotateCw, Infinity, Compass, GitCommitVertical, Circle, Scale, Undo, Redo, ZoomIn, ZoomOut, Radio } = lucideReact;
+        const WindIcon = Wind;
+
+        interface Point {
+  id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  type: 'VOR' | 'DME' | 'WAYPOINT' | 'PET';
+}
+
+interface Line {
+  id: string;
+  fromId: string;
+  toId: string;
+  color?: string;
+  tas?: number;
+}
+
+interface Turn {
+  id: string;
+  startPointId: string;
+  initialHeading: number;
+  degrees: number;
+  direction: 'LEFT' | 'RIGHT';
+  tas: number;
+  color?: string;
+}
+
+interface Wind {
+  direction: number;
+  speed: number;
+}
+
+interface PetMarker {
+  id: string;
+  fromId: string;
+  toId: string;
+}
+
+interface AngleQuotation {
+  id: string;
+  pointId: string;
+  line1Id: string;
+  line2Id?: string;
+  color?: string;
+}
+
+interface HistoryState {
+  points: Point[];
+  lines: Line[];
+  turns: Turn[];
+  petMarkers: PetMarker[];
+  wind: Wind;
+  tas: number;
+  endurance: number;
+  circles: Circle[];
+  infLines: InfLine[];
+  angleQuotations: AngleQuotation[];
+}
+
+type Tool = 'SELECT' | 'VOR' | 'WAYPOINT' | 'LINE' | 'PET' | 'TURN' | 'CIRCLE' | 'INF_LINE' | 'ANGLE';
+
+function formatDMS(deg: number, isLat: boolean): string {
+  const dir = isLat ? (deg >= 0 ? 'N' : 'S') : (deg >= 0 ? 'E' : 'W');
+  const absDeg = Math.abs(deg);
+  const d = Math.floor(absDeg);
+  const mFloat = (absDeg - d) * 60;
+  const m = Math.floor(mFloat);
+  const s = Math.round((mFloat - m) * 60);
+  return `${d.toString().padStart(isLat ? 2 : 3, '0')}°${m.toString().padStart(2, '0')}'${s.toString().padStart(2, '0')}"${dir}`;
+}
+
+function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const dLat = lat2 - lat1;
+  const dLon = lon2 - lon1;
+  const avgLat = (lat1 + lat2) / 2;
+  const nmLat = dLat * 60;
+  const nmLon = dLon * 60 * Math.cos(avgLat * Math.PI / 180);
+  return Math.sqrt(nmLat * nmLat + nmLon * nmLon);
+}
+
+function calculateBearing(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const lat1Rad = lat1 * Math.PI / 180;
+  const lat2Rad = lat2 * Math.PI / 180;
+  const y = Math.sin(dLon) * Math.cos(lat2Rad);
+  const x = Math.cos(lat1Rad) * Math.sin(lat2Rad) - Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLon);
+  let brng = Math.atan2(y, x) * 180 / Math.PI;
+  return (brng + 360) % 360;
+}
+
+function calculateDestination(lat1: number, lon1: number, brng: number, distNm: number) {
+  const R = 3440.065; // Earth radius in NM
+  const lat1Rad = lat1 * Math.PI / 180;
+  const lon1Rad = lon1 * Math.PI / 180;
+  const brngRad = brng * Math.PI / 180;
+  const dRad = distNm / R;
+
+  const lat2Rad = Math.asin(Math.sin(lat1Rad) * Math.cos(dRad) + Math.cos(lat1Rad) * Math.sin(dRad) * Math.cos(brngRad));
+  const lon2Rad = lon1Rad + Math.atan2(Math.sin(brngRad) * Math.sin(dRad) * Math.cos(lat1Rad), Math.cos(dRad) - Math.sin(lat1Rad) * Math.sin(lat2Rad));
+
+  return {
+    lat: lat2Rad * 180 / Math.PI,
+    lon: lon2Rad * 180 / Math.PI
+  };
+}
+
+function calculateWindTriangle(tc: number, tas: number, windDir: number, windSpd: number) {
+  const windAngle = (windDir - tc + 360) % 360;
+  const crossWind = windSpd * Math.sin(windAngle * Math.PI / 180);
+  const headWind = windSpd * Math.cos(windAngle * Math.PI / 180);
+
+  const wcaRad = Math.asin(crossWind / tas);
+  const wca = wcaRad * 180 / Math.PI;
+
+  const th = (tc + wca + 360) % 360;
+  const gs = tas * Math.cos(wcaRad) - headWind;
+
+  return { th, gs, wca };
+}
+
+function calculatePetLocation(p1: Point, p2: Point, tas: number, wind: Wind): { lat: number, lon: number, dist: number } | null {
+  const dist = calculateDistance(p1.lat, p1.lon, p2.lat, p2.lon);
+  const tc = calculateBearing(p1.lat, p1.lon, p2.lat, p2.lon);
+  
+  const outBound = calculateWindTriangle(tc, tas, wind.direction, wind.speed);
+  const returnTc = (tc + 180) % 360;
+  const inBound = calculateWindTriangle(returnTc, tas, wind.direction, wind.speed);
+  
+  const petDist = (dist * inBound.gs) / (outBound.gs + inBound.gs);
+  
+  if (petDist <= dist && petDist >= 0) {
+     const dest = calculateDestination(p1.lat, p1.lon, tc, petDist);
+     return { ...dest, dist: petDist };
+  }
+  return null;
+}
+
+interface Point2D { x: number; y: number; }
+interface Line2D { x1: number; y1: number; x2: number; y2: number; isInfinite: boolean; }
+interface Circle2D { cx: number; cy: number; r: number; }
+
+function getLineLineIntersection(l1: Line2D, l2: Line2D): Point2D | null {
+  const denominator = (l1.x1 - l1.x2) * (l2.y1 - l2.y2) - (l1.y1 - l1.y2) * (l2.x1 - l2.x2);
+  if (Math.abs(denominator) < 1e-6) return null; // Parallel
+
+  const t = ((l1.x1 - l2.x1) * (l2.y1 - l2.y2) - (l1.y1 - l2.y1) * (l2.x1 - l2.x2)) / denominator;
+  const u = -((l1.x1 - l1.x2) * (l1.y1 - l2.y1) - (l1.y1 - l1.y2) * (l1.x1 - l2.x1)) / denominator;
+
+  if (!l1.isInfinite && (t < 0 || t > 1)) return null;
+  if (!l2.isInfinite && (u < 0 || u > 1)) return null;
+
+  return {
+    x: l1.x1 + t * (l1.x2 - l1.x1),
+    y: l1.y1 + t * (l1.y2 - l1.y1)
+  };
+}
+
+function getLineCircleIntersections(l: Line2D, c: Circle2D): Point2D[] {
+  const dx = l.x2 - l.x1;
+  const dy = l.y2 - l.y1;
+  const A = dx * dx + dy * dy;
+  const B = 2 * (dx * (l.x1 - c.cx) + dy * (l.y1 - c.cy));
+  const C = (l.x1 - c.cx) * (l.x1 - c.cx) + (l.y1 - c.cy) * (l.y1 - c.cy) - c.r * c.r;
+
+  const det = B * B - 4 * A * C;
+  if (det < 0 || A === 0) return [];
+
+  const t1 = (-B + Math.sqrt(det)) / (2 * A);
+  const t2 = (-B - Math.sqrt(det)) / (2 * A);
+
+  const pts: Point2D[] = [];
+  if (l.isInfinite || (t1 >= 0 && t1 <= 1)) {
+    pts.push({ x: l.x1 + t1 * dx, y: l.y1 + t1 * dy });
+  }
+  if (det > 0 && (l.isInfinite || (t2 >= 0 && t2 <= 1))) {
+    pts.push({ x: l.x1 + t2 * dx, y: l.y1 + t2 * dy });
+  }
+  return pts;
+}
+
+function getCircleCircleIntersections(c1: Circle2D, c2: Circle2D): Point2D[] {
+  const dx = c2.cx - c1.cx;
+  const dy = c2.cy - c1.cy;
+  const d = Math.sqrt(dx * dx + dy * dy);
+
+  if (d > c1.r + c2.r || d < Math.abs(c1.r - c2.r) || d === 0) return [];
+
+  const a = (c1.r * c1.r - c2.r * c2.r + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, c1.r * c1.r - a * a));
+
+  const px = c1.cx + a * dx / d;
+  const py = c1.cy + a * dy / d;
+
+  if (h === 0) return [{ x: px, y: py }];
+
+  return [
+    { x: px + h * dy / d, y: py - h * dx / d },
+    { x: px - h * dy / d, y: py + h * dx / d }
+  ];
+}
+
+
+interface Circle { id: string; lat: number; lon: number; radiusNm: number; color: string; }
+interface InfLine { id: string; lat1: number; lon1: number; lat2: number; lon2: number; color: string; }
+
+function MapTab() {
+  const canvasRef = useRef(null);
+  const containerRef = useRef(null);
+
+  const [points, setPoints] = useState([
+    { id: 'LIN', name: 'LIN', lat: 45.43, lon: 9.28, type: 'VOR' },
+    { id: 'MIL', name: 'MIL', lat: 45.63, lon: 8.73, type: 'VOR' }
+  ]);
+  const [lines, setLines] = useState([
+    { id: 'LIN-MIL', fromId: 'LIN', toId: 'MIL' }
+  ]);
+  const [circles, setCircles] = useState([]);
+  const [infLines, setInfLines] = useState([]);
+  const [angleQuotations, setAngleQuotations] = useState([]);
+  const [turns, setTurns] = useState([]);
+  const [petMarkers, setPetMarkers] = useState([]);
+  const [wind, setWind] = useState({ direction: 0, speed: 0 });
+  const [tas, setTas] = useState(100); // Default TAS 100kt
+  const [endurance, setEndurance] = useState(4); // hours
+  const [center, setCenter] = useState({ lat: 45.5, lon: 9.0 });
+  const [zoom, setZoom] = useState(10); // pixels per NM
+  const [mousePos, setMousePos] = useState({ lat: 0, lon: 0 });
+  const [tool, setTool] = useState('SELECT');
+  const [lineStartPoint, setLineStartPoint] = useState(null);
+  const [drawStartPoint, setDrawStartPoint] = useState(null);
+  const [turnStart, setTurnStart] = useState(null);
+  const [selectedPointIds, setSelectedPointIds] = useState([]);
+  const [selectedLineIds, setSelectedLineIds] = useState([]);
+  const [selectedTurnIds, setSelectedTurnIds] = useState([]);
+  const [selectedCircleIds, setSelectedCircleIds] = useState([]);
+  const [selectedInfLineIds, setSelectedInfLineIds] = useState([]);
+  const [selectedAngleQuotationIds, setSelectedAngleQuotationIds] = useState([]);
+  const [showNavMenu, setShowNavMenu] = useState(false);
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [activeColor, setActiveColor] = useState('#2563eb'); // Default Blue-600
+  const [printImage, setPrintImage] = useState(null);
+  
+  const [angleVertexId, setAngleVertexId] = useState(null);
+  const [angleLine1Id, setAngleLine1Id] = useState(null);
+  
+  const [undoStack, setUndoStack] = useState([]);
+  const [redoStack, setRedoStack] = useState([]);
+
+  const saveToHistory = useCallback(() => {
+    setUndoStack(prev => {
+      const newState = {
+        points,
+        lines,
+        turns,
+        petMarkers,
+        wind,
+        tas,
+        endurance,
+        circles,
+        infLines,
+        angleQuotations
+      };
+      // Limit history to 50 steps
+      const next = [...prev, newState];
+      if (next.length > 50) return next.slice(next.length - 50);
+      return next;
+    });
+    setRedoStack([]);
+  }, [points, lines, turns, petMarkers, wind, tas, endurance, circles, infLines, angleQuotations]);
+
+  const undo = useCallback(() => {
+    if (undoStack.length === 0) return;
+    
+    const prevState = undoStack[undoStack.length - 1];
+    const currentState = {
+      points,
+      lines,
+      turns,
+      petMarkers,
+      wind,
+      tas,
+      endurance,
+      circles,
+      infLines,
+      angleQuotations
+    };
+
+    setRedoStack(prev => [...prev, currentState]);
+    setUndoStack(prev => prev.slice(0, -1));
+
+    setPoints(prevState.points);
+    setLines(prevState.lines);
+    setTurns(prevState.turns);
+    setPetMarkers(prevState.petMarkers);
+    setWind(prevState.wind);
+    setTas(prevState.tas);
+    setEndurance(prevState.endurance);
+    setCircles(prevState.circles || []);
+    setInfLines(prevState.infLines || []);
+    setAngleQuotations(prevState.angleQuotations || []);
+  }, [undoStack, points, lines, turns, petMarkers, wind, tas, endurance, circles, infLines, angleQuotations]);
+
+  const redo = useCallback(() => {
+    if (redoStack.length === 0) return;
+
+    const nextState = redoStack[redoStack.length - 1];
+    const currentState = {
+      points,
+      lines,
+      turns,
+      petMarkers,
+      wind,
+      tas,
+      endurance,
+      circles,
+      infLines,
+      angleQuotations
+    };
+
+    setUndoStack(prev => [...prev, currentState]);
+    setRedoStack(prev => prev.slice(0, -1));
+
+    setPoints(nextState.points);
+    setLines(nextState.lines);
+    setTurns(nextState.turns);
+    setPetMarkers(nextState.petMarkers);
+    setWind(nextState.wind);
+    setTas(nextState.tas);
+    setEndurance(nextState.endurance);
+    setCircles(nextState.circles || []);
+    setInfLines(nextState.infLines || []);
+    setAngleQuotations(nextState.angleQuotations || []);
+  }, [redoStack, points, lines, turns, petMarkers, wind, tas, endurance, circles, infLines, angleQuotations]);
+
+  const COLORS = [
+    { name: 'Blue', value: '#2563eb' },
+    { name: 'Red', value: '#dc2626' },
+    { name: 'Green', value: '#16a34a' },
+    { name: 'Orange', value: '#ea580c' },
+    { name: 'Purple', value: '#9333ea' },
+    { name: 'Black', value: '#000000' },
+  ];
+  
+  // Dynamic Input State
+  const [cursorScreenPos, setCursorScreenPos] = useState({ x: 0, y: 0 });
+  const [commandBuffer, setCommandBuffer] = useState('');
+
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const dragOccurred = useRef(false);
+
+  const allPoints = React.useMemo(() => {
+    const petPoints = petMarkers.map(pet => {
+      const p1 = points.find(p => p.id === pet.fromId);
+      const p2 = points.find(p => p.id === pet.toId);
+      if (p1 && p2 && tas > 0) {
+         const pos = calculatePetLocation(p1, p2, tas, wind);
+         if (pos) {
+           return { id: pet.id, name: `PET ${pos.dist.toFixed(1)}`, lat: pos.lat, lon: pos.lon, type: 'PET' };
+         }
+      }
+      return null;
+    }).filter(p => p !== null);
+    
+    return [...points, ...petPoints];
+  }, [points, petMarkers, tas, wind]);
+
+  const handleAutoFit = useCallback(() => {
+    const coords: { lat: number, lon: number }[] = [];
+    
+    // 1. Collect all relevant points from the map
+    allPoints.forEach(p => {
+      if (!isNaN(p.lat) && !isNaN(p.lon)) {
+        coords.push({ lat: p.lat, lon: p.lon });
+      }
+    });
+    
+    circles.forEach(c => {
+      if (!isNaN(c.lat) && !isNaN(c.lon)) {
+        const dLat = c.radiusNm / 60;
+        const cosLat = Math.cos(c.lat * Math.PI / 180);
+        const dLon = c.radiusNm / (60 * Math.max(Math.abs(cosLat), 0.01));
+        coords.push({ lat: c.lat + dLat, lon: c.lon });
+        coords.push({ lat: c.lat - dLat, lon: c.lon });
+        coords.push({ lat: c.lat, lon: c.lon + dLon });
+        coords.push({ lat: c.lat, lon: c.lon - dLon });
+      }
+    });
+    
+    infLines.forEach(l => {
+      if (!isNaN(l.lat1) && !isNaN(l.lon1)) coords.push({ lat: l.lat1, lon: l.lon1 });
+      if (!isNaN(l.lat2) && !isNaN(l.lon2)) coords.push({ lat: l.lat2, lon: l.lon2 });
+    });
+
+    turns.forEach(t => {
+      const p = allPoints.find(pt => pt.id === t.startPointId);
+      if (p && !isNaN(p.lat) && !isNaN(p.lon)) {
+        const turnTas = t.tas || tas || 100;
+        const radiusNm = turnTas / (60 * Math.PI);
+        const centerBearing = t.direction === 'RIGHT' 
+          ? (t.initialHeading + 90) % 360 
+          : (t.initialHeading - 90 + 360) % 360;
+        const turnCenter = calculateDestination(p.lat, p.lon, centerBearing, radiusNm);
+        
+        coords.push({ lat: turnCenter.lat, lon: turnCenter.lon });
+        const dLat = radiusNm / 60;
+        const cosLat = Math.cos(turnCenter.lat * Math.PI / 180);
+        const dLon = radiusNm / (60 * Math.max(Math.abs(cosLat), 0.01));
+        coords.push({ lat: turnCenter.lat + dLat, lon: turnCenter.lon });
+        coords.push({ lat: turnCenter.lat - dLat, lon: turnCenter.lon });
+        coords.push({ lat: turnCenter.lat, lon: turnCenter.lon + dLon });
+        coords.push({ lat: turnCenter.lat, lon: turnCenter.lon - dLon });
+      }
+    });
+
+    if (coords.length === 0) {
+      setCenter({ lat: 45.5, lon: 9.0 });
+      setZoom(10);
+      return;
+    }
+
+    // 2. Calculate Bounding Box
+    let minLat = 90, maxLat = -90;
+    let minLon = 180, maxLon = -180;
+
+    coords.forEach(p => {
+      if (p.lat < minLat) minLat = p.lat;
+      if (p.lat > maxLat) maxLat = p.lat;
+      if (p.lon < minLon) minLon = p.lon;
+      if (p.lon > maxLon) maxLon = p.lon;
+    });
+
+    // 3. Set Center
+    const centerLat = (minLat + maxLat) / 2;
+    const centerLon = (minLon + maxLon) / 2;
+
+    // 4. Calculate Zoom
+    const latRange = Math.max(maxLat - minLat, 0.01);
+    const lonRange = Math.max(maxLon - minLon, 0.01);
+    
+    const cosLat = Math.cos(centerLat * Math.PI / 180);
+    const widthNM = lonRange * 60 * Math.max(Math.abs(cosLat), 0.1);
+    const heightNM = latRange * 60;
+
+    const canvas = canvasRef.current;
+    if (canvas && canvas.width > 0 && canvas.height > 0) {
+      const padding = 0.75; // Use 75% of the canvas
+      const zoomX = (canvas.width * padding) / widthNM;
+      const zoomY = (canvas.height * padding) / heightNM;
+      
+      let newZoom = Math.min(zoomX, zoomY);
+      // Reasonable zoom limits: 0.1 to 200 pixels per NM
+      newZoom = Math.max(0.1, Math.min(newZoom, 200));
+      
+      setZoom(newZoom);
+    }
+    setCenter({ lat: centerLat, lon: centerLon });
+  }, [allPoints, circles, infLines, turns, tas, setCenter, setZoom]);
+
+  const latLonToXY = useCallback((lat: number, lon: number, width: number, height: number) => {
+    const dLat = lat - center.lat;
+    const dLon = lon - center.lon;
+    const y = -dLat * 60 * zoom;
+    const x = dLon * 60 * Math.cos(center.lat * Math.PI / 180) * zoom;
+    return { x: width / 2 + x, y: height / 2 + y };
+  }, [center, zoom]);
+
+  const xyToLatLon = useCallback((x: number, y: number, width: number, height: number) => {
+    const dx = x - width / 2;
+    const dy = y - height / 2;
+    const dLat = -dy / (60 * zoom);
+    const dLon = dx / (60 * Math.cos(center.lat * Math.PI / 180) * zoom);
+    return { lat: center.lat + dLat, lon: center.lon + dLon };
+  }, [center, zoom]);
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const width = canvas.width;
+    const height = canvas.height;
+
+    // Clear
+    ctx.fillStyle = '#f4f4f5'; // Zinc-100 equivalent for canvas background
+    ctx.fillRect(0, 0, width, height);
+
+    // Draw Grid (Crosshair at center)
+    ctx.strokeStyle = '#e4e4e7'; // Zinc-200
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(width / 2, 0);
+    ctx.lineTo(width / 2, height);
+    ctx.moveTo(0, height / 2);
+    ctx.lineTo(width, height / 2);
+    ctx.stroke();
+
+    // Draw lines
+    lines.forEach(line => {
+      const p1 = allPoints.find(p => p.id === line.fromId);
+      const p2 = allPoints.find(p => p.id === line.toId);
+      if (p1 && p2) {
+        const xy1 = latLonToXY(p1.lat, p1.lon, width, height);
+        const xy2 = latLonToXY(p2.lat, p2.lon, width, height);
+        
+        const isSelected = selectedLineIds.includes(line.id);
+        const lineColor = line.color || '#2563eb';
+        
+        if (isSelected) {
+          ctx.strokeStyle = lineColor;
+          ctx.globalAlpha = 0.3;
+          ctx.lineWidth = 8;
+          ctx.beginPath();
+          ctx.moveTo(xy1.x, xy1.y);
+          ctx.lineTo(xy2.x, xy2.y);
+          ctx.stroke();
+          ctx.globalAlpha = 1.0;
+        }
+
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.beginPath();
+        ctx.moveTo(xy1.x, xy1.y);
+        ctx.lineTo(xy2.x, xy2.y);
+        ctx.stroke();
+
+        const dist = calculateDistance(p1.lat, p1.lon, p2.lat, p2.lon);
+        const tc = calculateBearing(p1.lat, p1.lon, p2.lat, p2.lon);
+        
+        const midX = (xy1.x + xy2.x) / 2;
+        const midY = (xy1.y + xy2.y) / 2;
+        
+        const angle = Math.atan2(xy2.y - xy1.y, xy2.x - xy1.x);
+
+        // Draw arrow head
+        const arrowSize = isSelected ? 10 : 8;
+        const offset = 12;
+        const tipX = xy2.x - offset * Math.cos(angle);
+        const tipY = xy2.y - offset * Math.sin(angle);
+        
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo(tipX - arrowSize * Math.cos(angle - Math.PI / 6), tipY - arrowSize * Math.sin(angle - Math.PI / 6));
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo(tipX - arrowSize * Math.cos(angle + Math.PI / 6), tipY - arrowSize * Math.sin(angle + Math.PI / 6));
+        ctx.stroke();
+
+        let textAngle = angle;
+        if (Math.abs(textAngle) > Math.PI / 2) {
+          textAngle += Math.PI;
+        }
+
+        ctx.save();
+        ctx.translate(midX, midY);
+        ctx.rotate(textAngle);
+
+        ctx.fillStyle = line.color || '#1e3a8a'; // Use line color or default Blue-900
+        ctx.font = '12px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(`${tc.toFixed(0).padStart(3, '0')}° / ${dist.toFixed(1)} NM`, 0, -5);
+
+        const lineTas = line.tas || tas; // Use line TAS or global TAS
+        if (lineTas > 0) {
+          const outBound = calculateWindTriangle(tc, lineTas, wind.direction, wind.speed);
+          ctx.fillStyle = '#b45309'; // Amber-700
+          ctx.textBaseline = 'top';
+          ctx.fillText(`TH:${outBound.th.toFixed(0).padStart(3, '0')}° GS:${outBound.gs.toFixed(0)}`, 0, 5);
+        }
+        ctx.restore();
+      }
+    });
+
+    // Draw Turns
+    turns.forEach(turn => {
+      const p = allPoints.find(p => p.id === turn.startPointId);
+      if (p) {
+        const xy = latLonToXY(p.lat, p.lon, width, height);
+        const turnTas = turn.tas || tas;
+        // Radius for Rate 1 turn: R = TAS / (60 * PI)
+        // Convert NM to pixels
+        const radiusNm = turnTas / (60 * Math.PI);
+        const radiusPx = radiusNm * zoom;
+
+        const startAngle = (turn.initialHeading - 90) * Math.PI / 180; // Canvas 0 is Right (East), so North is -90
+        
+        // Calculate center of turn
+        // If Right Turn: Center is 90 deg right of initial heading
+        // If Left Turn: Center is 90 deg left of initial heading
+        const centerBearing = turn.direction === 'RIGHT' 
+          ? (turn.initialHeading + 90) % 360 
+          : (turn.initialHeading - 90 + 360) % 360;
+        
+        const centerAngleRad = (centerBearing - 90) * Math.PI / 180;
+        const centerX = xy.x + radiusPx * Math.cos(centerAngleRad);
+        const centerY = xy.y + radiusPx * Math.sin(centerAngleRad);
+
+        // Draw Arc
+        ctx.beginPath();
+        const startArcAngle = (centerBearing + 180) % 360; // From center to start point
+        const startRad = (startArcAngle - 90) * Math.PI / 180;
+        
+        // End Angle
+        // Right Turn: Add degrees
+        // Left Turn: Subtract degrees
+        const endArcAngle = turn.direction === 'RIGHT'
+          ? (startArcAngle + turn.degrees) % 360
+          : (startArcAngle - turn.degrees + 360) % 360;
+        const endRad = (endArcAngle - 90) * Math.PI / 180;
+
+        const isSelected = selectedTurnIds.includes(turn.id);
+        const turnColor = turn.color || '#2563eb';
+
+        if (isSelected) {
+          ctx.strokeStyle = turnColor;
+          ctx.globalAlpha = 0.3;
+          ctx.lineWidth = 8;
+          ctx.beginPath();
+          ctx.arc(centerX, centerY, radiusPx, startRad, endRad, turn.direction === 'LEFT');
+          ctx.stroke();
+          ctx.globalAlpha = 1.0;
+        }
+
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radiusPx, startRad, endRad, turn.direction === 'LEFT');
+        ctx.strokeStyle = turnColor;
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.stroke();
+
+        // Draw Arrow at end
+        const endX = centerX + radiusPx * Math.cos(endRad);
+        const endY = centerY + radiusPx * Math.sin(endRad);
+        
+        // Tangent at end
+        // Right Turn: Tangent is +90 from radius
+        // Left Turn: Tangent is -90 from radius
+        const tangentAngle = turn.direction === 'RIGHT'
+          ? endRad + Math.PI / 2
+          : endRad - Math.PI / 2;
+
+        const arrowSize = 8;
+        ctx.beginPath();
+        ctx.moveTo(endX, endY);
+        ctx.lineTo(endX - arrowSize * Math.cos(tangentAngle - Math.PI / 6), endY - arrowSize * Math.sin(tangentAngle - Math.PI / 6));
+        ctx.moveTo(endX, endY);
+        ctx.lineTo(endX - arrowSize * Math.cos(tangentAngle + Math.PI / 6), endY - arrowSize * Math.sin(tangentAngle + Math.PI / 6));
+        ctx.stroke();
+        
+        // Label
+        ctx.fillStyle = turn.color || '#1e3a8a';
+        ctx.font = '10px "JetBrains Mono", monospace';
+        ctx.fillText(`${turn.degrees.toFixed(0)}° ${turn.direction === 'RIGHT' ? 'R' : 'L'}`, centerX, centerY);
+      }
+    });
+
+    // Draw active turn preview
+    if (tool === 'TURN' && turnStart) {
+      const p = allPoints.find(p => p.id === turnStart.pointId);
+      if (p) {
+        const xy = latLonToXY(p.lat, p.lon, width, height);
+        const mouseX = cursorScreenPos.x; // Use cursorScreenPos for smoother updates? No, mousePos is lat/lon. Need xy from mousePos.
+        // Actually mousePos is updated on mouse move, let's use that.
+        const mouseXy = latLonToXY(mousePos.lat, mousePos.lon, width, height);
+
+        const turnTas = tas || 100; // Use global TAS for preview
+        const radiusNm = turnTas / (60 * Math.PI);
+        const radiusPx = radiusNm * zoom;
+
+        // Determine direction based on mouse position relative to initial heading vector
+        // Vector P -> Mouse
+        const dx = mouseXy.x - xy.x;
+        const dy = mouseXy.y - xy.y;
+        const mouseBearing = (Math.atan2(dy, dx) * 180 / Math.PI + 90 + 360) % 360;
+        
+        const angleDiff = (mouseBearing - turnStart.initialHeading + 360) % 360;
+        const direction = angleDiff < 180 ? 'RIGHT' : 'LEFT';
+        
+        // Calculate degrees based on projection? 
+        // Or just use the angle difference as the turn amount?
+        // If I move mouse 90 deg right, I want a 90 deg turn.
+        let degrees = direction === 'RIGHT' ? angleDiff : (360 - angleDiff);
+        
+        // Cap at 360
+        if (degrees > 360) degrees = 360;
+
+        // Draw Preview
+        const centerBearing = direction === 'RIGHT' 
+          ? (turnStart.initialHeading + 90) % 360 
+          : (turnStart.initialHeading - 90 + 360) % 360;
+        
+        const centerAngleRad = (centerBearing - 90) * Math.PI / 180;
+        const centerX = xy.x + radiusPx * Math.cos(centerAngleRad);
+        const centerY = xy.y + radiusPx * Math.sin(centerAngleRad);
+
+        ctx.beginPath();
+        const startArcAngle = (centerBearing + 180) % 360;
+        const startRad = (startArcAngle - 90) * Math.PI / 180;
+        
+        const endArcAngle = direction === 'RIGHT'
+          ? (startArcAngle + degrees) % 360
+          : (startArcAngle - degrees + 360) % 360;
+        const endRad = (endArcAngle - 90) * Math.PI / 180;
+
+        ctx.arc(centerX, centerY, radiusPx, startRad, endRad, direction === 'LEFT');
+        ctx.strokeStyle = activeColor;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([5, 5]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        
+        // Draw label
+        ctx.fillStyle = activeColor;
+        ctx.fillText(`${degrees.toFixed(0)}° ${direction === 'RIGHT' ? 'R' : 'L'}`, mouseXy.x + 10, mouseXy.y);
+      }
+    }
+
+    // Draw active line if in LINE or PET tool
+    if ((tool === 'LINE' || tool === 'PET') && lineStartPoint) {
+      const p1 = allPoints.find(p => p.id === lineStartPoint);
+      if (p1) {
+        const xy1 = latLonToXY(p1.lat, p1.lon, width, height);
+        const xy2 = latLonToXY(mousePos.lat, mousePos.lon, width, height);
+        
+        ctx.strokeStyle = '#71717a'; // Zinc-500
+        ctx.lineWidth = 1;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(xy1.x, xy1.y);
+        ctx.lineTo(xy2.x, xy2.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    if (drawStartPoint) {
+      const xy1 = latLonToXY(drawStartPoint.lat, drawStartPoint.lon, width, height);
+      const xy2 = latLonToXY(mousePos.lat, mousePos.lon, width, height);
+
+      if (tool === 'CIRCLE') {
+        const dx = xy2.x - xy1.x;
+        const dy = xy2.y - xy1.y;
+        const r = Math.sqrt(dx * dx + dy * dy);
+        
+        ctx.strokeStyle = activeColor;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.arc(xy1.x, xy1.y, r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } else if (tool === 'INF_LINE') {
+        const dx = xy2.x - xy1.x;
+        const dy = xy2.y - xy1.y;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        
+        if (len > 0) {
+          const ext = 10000;
+          const startX = xy1.x - (dx / len) * ext;
+          const startY = xy1.y - (dy / len) * ext;
+          const endX = xy1.x + (dx / len) * ext;
+          const endY = xy1.y + (dy / len) * ext;
+
+          ctx.strokeStyle = activeColor;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([5, 5]);
+          ctx.beginPath();
+          ctx.moveTo(startX, startY);
+          ctx.lineTo(endX, endY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+    }
+
+    allPoints.forEach(p => {
+      const xy = latLonToXY(p.lat, p.lon, width, height);
+      
+      const isSelected = selectedPointIds.includes(p.id);
+
+      if (isSelected) {
+        ctx.strokeStyle = '#db2777';
+        ctx.globalAlpha = 0.3;
+        ctx.lineWidth = 10;
+        ctx.beginPath();
+        ctx.arc(xy.x, xy.y, 12, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+      }
+
+      ctx.strokeStyle = isSelected ? '#db2777' : '#0f766e'; // Pink-600 selected, Teal-700 normal
+      ctx.lineWidth = isSelected ? 3 : 2;
+      
+      if (p.type === 'VOR' || p.type === 'DME') {
+        // Draw Hexagon
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+          const angle = i * Math.PI / 3;
+          const hx = xy.x + 8 * Math.cos(angle);
+          const hy = xy.y + 8 * Math.sin(angle);
+          if (i === 0) ctx.moveTo(hx, hy);
+          else ctx.lineTo(hx, hy);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        // Draw Square (circumscribed to hexagon)
+        ctx.beginPath();
+        ctx.rect(xy.x - 8, xy.y - 8, 16, 16);
+        ctx.stroke();
+      } else {
+        // WAYPOINT - Circle
+        ctx.beginPath();
+        ctx.arc(xy.x, xy.y, 6, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = isSelected ? '#db2777' : '#0f766e';
+      ctx.beginPath();
+      ctx.arc(xy.x, xy.y, 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#18181b'; // Zinc-900
+      ctx.font = '14px "JetBrains Mono", monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(p.name, xy.x + 12, xy.y);
+    });
+
+    // Draw Circles
+    circles.forEach(c => {
+      const xy = latLonToXY(c.lat, c.lon, width, height);
+      const isSelected = selectedCircleIds.includes(c.id);
+      ctx.strokeStyle = isSelected ? '#3b82f6' : c.color;
+      ctx.lineWidth = isSelected ? 3 : 2;
+      ctx.beginPath();
+      ctx.arc(xy.x, xy.y, c.radiusNm * zoom, 0, 2 * Math.PI);
+      ctx.stroke();
+    });
+
+    // Draw InfLines
+    infLines.forEach(l => {
+      const isSelected = selectedInfLineIds.includes(l.id);
+      ctx.strokeStyle = isSelected ? '#3b82f6' : l.color;
+      ctx.lineWidth = isSelected ? 3 : 1;
+      ctx.setLineDash([5, 5]);
+      
+      const p1 = latLonToXY(l.lat1, l.lon1, width, height);
+      const p2 = latLonToXY(l.lat2, l.lon2, width, height);
+      
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const len = Math.sqrt(dx*dx + dy*dy);
+      if (len === 0) return;
+      
+      // Extend far away
+      const ext = 10000;
+      const startX = p1.x - (dx/len)*ext;
+      const startY = p1.y - (dy/len)*ext;
+      const endX = p1.x + (dx/len)*ext;
+      const endY = p1.y + (dy/len)*ext;
+      
+      ctx.beginPath();
+      ctx.moveTo(startX, startY);
+      ctx.lineTo(endX, endY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+
+    // Draw Angle Quotations
+    angleQuotations.forEach(aq => {
+      const p = allPoints.find(pt => pt.id === aq.pointId);
+      const l1 = lines.find(l => l.id === aq.line1Id);
+      if (!p || !l1) return;
+
+      const xy = latLonToXY(p.lat, p.lon, width, height);
+      
+      // Bearing of line 1 from vertex
+      let b1 = 0;
+      if (l1.fromId === p.id) {
+        const pTo = allPoints.find(pt => pt.id === l1.toId);
+        if (pTo) b1 = calculateBearing(p.lat, p.lon, pTo.lat, pTo.lon);
+      } else {
+        const pFrom = allPoints.find(pt => pt.id === l1.fromId);
+        if (pFrom) b1 = calculateBearing(p.lat, p.lon, pFrom.lat, pFrom.lon);
+      }
+
+      let b2 = 0; // Default North
+      if (aq.line2Id) {
+        const l2 = lines.find(l => l.id === aq.line2Id);
+        if (l2) {
+          if (l2.fromId === p.id) {
+            const pTo = allPoints.find(pt => pt.id === l2.toId);
+            if (pTo) b2 = calculateBearing(p.lat, p.lon, pTo.lat, pTo.lon);
+          } else {
+            const pFrom = allPoints.find(pt => pt.id === l2.fromId);
+            if (pFrom) b2 = calculateBearing(p.lat, p.lon, pFrom.lat, pFrom.lon);
+          }
+        }
+      }
+
+      const startAngle = (b2 - 90) * Math.PI / 180;
+      const endAngle = (b1 - 90) * Math.PI / 180;
+      
+      let diff = (b1 - b2 + 360) % 360;
+      if (diff > 180) diff = diff - 360;
+
+      const radius = 40;
+      const isSelected = selectedAngleQuotationIds.includes(aq.id);
+      ctx.strokeStyle = isSelected ? '#3b82f6' : (aq.color || '#4b5563');
+      ctx.lineWidth = isSelected ? 3 : 1;
+      
+      if (isSelected) {
+        ctx.globalAlpha = 0.3;
+        ctx.lineWidth = 8;
+        ctx.beginPath();
+        ctx.arc(xy.x, xy.y, radius, startAngle, endAngle, diff < 0);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+        ctx.lineWidth = 3;
+      }
+
+      ctx.beginPath();
+      ctx.arc(xy.x, xy.y, radius, startAngle, endAngle, diff < 0);
+      ctx.stroke();
+
+      // Label
+      const midBearing = (b2 + diff / 2 + 360) % 360;
+      const labelRad = (midBearing - 90) * Math.PI / 180;
+      const labelX = xy.x + (radius + 15) * Math.cos(labelRad);
+      const labelY = xy.y + (radius + 15) * Math.sin(labelRad);
+
+      ctx.fillStyle = aq.color || '#4b5563';
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(`${Math.abs(diff).toFixed(0)}°`, labelX, labelY);
+    });
+  }, [points, lines, wind, tas, endurance, center, zoom, mousePos, tool, lineStartPoint, drawStartPoint, latLonToXY, selectedPointIds, selectedLineIds, selectedTurnIds, circles, infLines, selectedCircleIds, selectedInfLineIds, activeColor, angleQuotations, selectedAngleQuotationIds]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      if (canvasRef.current && containerRef.current) {
+        canvasRef.current.width = containerRef.current.clientWidth;
+        canvasRef.current.height = containerRef.current.clientHeight;
+        draw();
+      }
+    };
+    window.addEventListener('resize', handleResize);
+    handleResize();
+    return () => window.removeEventListener('resize', handleResize);
+  }, [draw]);
+
+  useEffect(() => {
+    draw();
+  }, [draw]);
+
+  const handleMouseDown = (e) => {
+    dragOccurred.current = false;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    if (e.button === 1) {
+      setIsDragging(true);
+      setDragStart({ x: e.clientX, y: e.clientY });
+    } else if (e.button === 0 && tool === 'SELECT') {
+      const clickedPoint = allPoints.find(p => {
+        const xy = latLonToXY(p.lat, p.lon, canvas.width, canvas.height);
+        const dx = xy.x - x;
+        const dy = xy.y - y;
+        return Math.sqrt(dx*dx + dy*dy) < 15;
+      });
+
+      if (clickedPoint) {
+        if (e.shiftKey) {
+          setSelectedPointIds(prev => prev.includes(clickedPoint.id) ? prev.filter(id => id !== clickedPoint.id) : [...prev, clickedPoint.id]);
+        } else {
+          setSelectedPointIds([clickedPoint.id]);
+          setSelectedLineIds([]);
+          setSelectedTurnIds([]);
+          setSelectedCircleIds([]);
+          setSelectedInfLineIds([]);
+        }
+        return;
+      }
+
+      // Check for Turns
+      const clickedTurn = turns.find(turn => {
+        const p = allPoints.find(pt => pt.id === turn.startPointId);
+        if (!p) return false;
+        const xy = latLonToXY(p.lat, p.lon, canvas.width, canvas.height);
+        const turnTas = turn.tas || tas;
+        const radiusNm = turnTas / (60 * Math.PI);
+        const radiusPx = radiusNm * zoom;
+        
+        const centerBearing = turn.direction === 'RIGHT' 
+          ? (turn.initialHeading + 90) % 360 
+          : (turn.initialHeading - 90 + 360) % 360;
+        const centerAngleRad = (centerBearing - 90) * Math.PI / 180;
+        const centerX = xy.x + radiusPx * Math.cos(centerAngleRad);
+        const centerY = xy.y + radiusPx * Math.sin(centerAngleRad);
+
+        const dx = x - centerX;
+        const dy = y - centerY;
+        const distToCenter = Math.sqrt(dx*dx + dy*dy);
+        
+        if (Math.abs(distToCenter - radiusPx) > 10) return false;
+
+        const angleToPoint = (Math.atan2(dy, dx) * 180 / Math.PI + 90 + 360) % 360;
+        const startArcAngle = (centerBearing + 180) % 360;
+        
+        const diff = (angleToPoint - startArcAngle + 360) % 360;
+        if (turn.direction === 'RIGHT') {
+          return diff <= turn.degrees;
+        } else {
+          return (360 - diff) % 360 <= turn.degrees;
+        }
+      });
+
+      if (clickedTurn) {
+        if (e.shiftKey) {
+          setSelectedTurnIds(prev => prev.includes(clickedTurn.id) ? prev.filter(id => id !== clickedTurn.id) : [...prev, clickedTurn.id]);
+        } else {
+          setSelectedTurnIds([clickedTurn.id]);
+          setSelectedPointIds([]);
+          setSelectedLineIds([]);
+          setSelectedCircleIds([]);
+          setSelectedInfLineIds([]);
+        }
+        if (clickedTurn.color) setActiveColor(clickedTurn.color);
+        return;
+      }
+
+      // Check for Lines
+      const clickedLine = lines.find(line => {
+        const p1 = allPoints.find(p => p.id === line.fromId);
+        const p2 = allPoints.find(p => p.id === line.toId);
+        if (!p1 || !p2) return false;
+        const xy1 = latLonToXY(p1.lat, p1.lon, canvas.width, canvas.height);
+        const xy2 = latLonToXY(p2.lat, p2.lon, canvas.width, canvas.height);
+        
+        const A = x - xy1.x;
+        const B = y - xy1.y;
+        const C = xy2.x - xy1.x;
+        const D = xy2.y - xy1.y;
+
+        const dot = A * C + B * D;
+        const len_sq = C * C + D * D;
+        let param = -1;
+        if (len_sq !== 0) param = dot / len_sq;
+
+        let xx, yy;
+        if (param < 0) {
+          xx = xy1.x; yy = xy1.y;
+        } else if (param > 1) {
+          xx = xy2.x; yy = xy2.y;
+        } else {
+          xx = xy1.x + param * C;
+          yy = xy1.y + param * D;
+        }
+
+        const dx = x - xx;
+        const dy = y - yy;
+        return Math.sqrt(dx*dx + dy*dy) < 10;
+      });
+
+      if (clickedLine) {
+        if (e.shiftKey) {
+          setSelectedLineIds(prev => prev.includes(clickedLine.id) ? prev.filter(id => id !== clickedLine.id) : [...prev, clickedLine.id]);
+        } else {
+          setSelectedLineIds([clickedLine.id]);
+          setSelectedPointIds([]);
+          setSelectedTurnIds([]);
+          setSelectedCircleIds([]);
+          setSelectedInfLineIds([]);
+        }
+        if (clickedLine.color) setActiveColor(clickedLine.color);
+        return;
+      }
+
+      // Check for Circles
+      const clickedCircle = circles.find(c => {
+        const xy = latLonToXY(c.lat, c.lon, canvas.width, canvas.height);
+        const dx = x - xy.x;
+        const dy = y - xy.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        const radiusPx = c.radiusNm * zoom;
+        return Math.abs(dist - radiusPx) < 10;
+      });
+
+      if (clickedCircle) {
+        if (e.shiftKey) {
+          setSelectedCircleIds(prev => prev.includes(clickedCircle.id) ? prev.filter(id => id !== clickedCircle.id) : [...prev, clickedCircle.id]);
+        } else {
+          setSelectedCircleIds([clickedCircle.id]);
+          setSelectedPointIds([]);
+          setSelectedLineIds([]);
+          setSelectedTurnIds([]);
+          setSelectedInfLineIds([]);
+        }
+        if (clickedCircle.color) setActiveColor(clickedCircle.color);
+        return;
+      }
+
+      // Check for InfLines
+      const clickedInfLine = infLines.find(l => {
+        const p1 = latLonToXY(l.lat1, l.lon1, canvas.width, canvas.height);
+        const p2 = latLonToXY(l.lat2, l.lon2, canvas.width, canvas.height);
+        
+        const A = x - p1.x;
+        const B = y - p1.y;
+        const C = p2.x - p1.x;
+        const D = p2.y - p1.y;
+
+        const dot = A * C + B * D;
+        const len_sq = C * C + D * D;
+        let param = -1;
+        if (len_sq !== 0) param = dot / len_sq;
+
+        let xx, yy;
+        if (param < 0) {
+          xx = p1.x; yy = p1.y;
+        } else if (param > 1) {
+          xx = p2.x; yy = p2.y;
+        } else {
+          xx = p1.x + param * C;
+          yy = p1.y + param * D;
+        }
+
+        const dx = x - xx;
+        const dy = y - yy;
+        return Math.sqrt(dx*dx + dy*dy) < 10;
+      });
+
+      if (clickedInfLine) {
+        if (e.shiftKey) {
+          setSelectedInfLineIds(prev => prev.includes(clickedInfLine.id) ? prev.filter(id => id !== clickedInfLine.id) : [...prev, clickedInfLine.id]);
+        } else {
+          setSelectedInfLineIds([clickedInfLine.id]);
+          setSelectedPointIds([]);
+          setSelectedLineIds([]);
+          setSelectedTurnIds([]);
+          setSelectedCircleIds([]);
+          setSelectedAngleQuotationIds([]);
+          if (clickedInfLine.color) setActiveColor(clickedInfLine.color);
+          return;
+        }
+      }
+
+      // Check for Angle Quotations
+      const clickedAQ = angleQuotations.find(aq => {
+        const p = allPoints.find(pt => pt.id === aq.pointId);
+        if (!p) return false;
+        const xy = latLonToXY(p.lat, p.lon, canvas.width, canvas.height);
+        const dx = x - xy.x;
+        const dy = y - xy.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        return Math.abs(dist - 40) < 10; // 40 is the arc radius
+      });
+
+      if (clickedAQ) {
+        setSelectedAngleQuotationIds([clickedAQ.id]);
+        setSelectedPointIds([]);
+        setSelectedLineIds([]);
+        setSelectedTurnIds([]);
+        setSelectedCircleIds([]);
+        setSelectedInfLineIds([]);
+        if (clickedAQ.color) setActiveColor(clickedAQ.color);
+        return;
+      }
+
+      setSelectedPointIds([]);
+      setSelectedLineIds([]);
+      setSelectedTurnIds([]);
+      setSelectedCircleIds([]);
+      setSelectedInfLineIds([]);
+      setSelectedAngleQuotationIds([]);
+    } else if (tool === 'VOR') {
+      saveToHistory();
+      const newName = `VOR${points.length + 1}`;
+      setPoints([...points, { id: newName, name: newName, lat: mousePos.lat, lon: mousePos.lon, type: 'VOR' }]);
+      setTool('SELECT');
+    } else if (tool === 'WAYPOINT') {
+      saveToHistory();
+      const newName = `WP${points.length + 1}`;
+      setPoints([...points, { id: newName, name: newName, lat: mousePos.lat, lon: mousePos.lon, type: 'WAYPOINT' }]);
+      setTool('SELECT');
+    } else if (tool === 'LINE') {
+      if (clickedPoint) {
+        if (!lineStartPoint) {
+          setLineStartPoint(clickedPoint.id);
+        } else {
+          if (lineStartPoint !== clickedPoint.id) {
+            saveToHistory();
+            setLines([...lines, { 
+              id: `${lineStartPoint}-${clickedPoint.id}-${Date.now()}`, 
+              fromId: lineStartPoint, 
+              toId: clickedPoint.id,
+              color: activeColor,
+              tas: tas
+            }]);
+          }
+          setLineStartPoint(null);
+          setTool('SELECT');
+        }
+      }
+    } else if (tool === 'PET') {
+      if (clickedPoint) {
+        if (!lineStartPoint) {
+          setLineStartPoint(clickedPoint.id);
+        } else {
+          if (lineStartPoint !== clickedPoint.id) {
+            saveToHistory();
+            setPetMarkers([...petMarkers, { id: `PET-${Date.now()}`, fromId: lineStartPoint, toId: clickedPoint.id }]);
+          }
+          setLineStartPoint(null);
+          setTool('SELECT');
+        }
+      }
+    } else if (tool === 'TURN') {
+      if (!turnStart) {
+        // First click: Select Start Point
+        if (clickedPoint) {
+          // Determine initial heading
+          // Find lines ending at this point
+          const incomingLines = lines.filter(l => l.toId === clickedPoint.id);
+          let initialHeading = 0; // Default North
+          if (incomingLines.length > 0) {
+            // Use the last one created or just the first one found?
+            // Let's use the last one in the array as it's likely the most recent segment
+            const lastLine = incomingLines[incomingLines.length - 1];
+            const pFrom = allPoints.find(p => p.id === lastLine.fromId);
+            if (pFrom) {
+              initialHeading = calculateBearing(pFrom.lat, pFrom.lon, clickedPoint.lat, clickedPoint.lon);
+            }
+          }
+          setTurnStart({ pointId: clickedPoint.id, initialHeading });
+        }
+      } else {
+        // Second click: Finish Turn
+        // Use current mouse position to calculate degrees and direction
+        const p = allPoints.find(p => p.id === turnStart.pointId);
+        if (p) {
+          const xy = latLonToXY(p.lat, p.lon, canvas.width, canvas.height);
+          const mouseXy = latLonToXY(mousePos.lat, mousePos.lon, canvas.width, canvas.height);
+          
+          const dx = mouseXy.x - xy.x;
+          const dy = mouseXy.y - xy.y;
+          const mouseBearing = (Math.atan2(dy, dx) * 180 / Math.PI + 90 + 360) % 360;
+          
+          const angleDiff = (mouseBearing - turnStart.initialHeading + 360) % 360;
+          const direction = angleDiff < 180 ? 'RIGHT' : 'LEFT';
+          let degrees = direction === 'RIGHT' ? angleDiff : (360 - angleDiff);
+          if (degrees > 360) degrees = 360;
+
+          saveToHistory();
+          setTurns([...turns, {
+            id: `TURN-${Date.now()}`,
+            startPointId: turnStart.pointId,
+            initialHeading: turnStart.initialHeading,
+            degrees,
+            direction,
+            tas: tas || 100, // Use current global TAS
+            color: activeColor
+          }]);
+          setTurnStart(null);
+          setTool('SELECT');
+        }
+      }
+    } else if (tool === 'CIRCLE') {
+      const targetLat = clickedPoint ? clickedPoint.lat : mousePos.lat;
+      const targetLon = clickedPoint ? clickedPoint.lon : mousePos.lon;
+      if (!drawStartPoint) {
+        setDrawStartPoint({ lat: targetLat, lon: targetLon });
+      } else {
+        const dist = calculateDistance(drawStartPoint.lat, drawStartPoint.lon, targetLat, targetLon);
+        saveToHistory();
+        setCircles([...circles, { id: `C-${Date.now()}`, lat: drawStartPoint.lat, lon: drawStartPoint.lon, radiusNm: dist, color: activeColor }]);
+        setDrawStartPoint(null);
+        setTool('SELECT');
+      }
+    } else if (tool === 'INF_LINE') {
+      const targetLat = clickedPoint ? clickedPoint.lat : mousePos.lat;
+      const targetLon = clickedPoint ? clickedPoint.lon : mousePos.lon;
+      if (!drawStartPoint) {
+        setDrawStartPoint({ lat: targetLat, lon: targetLon });
+      } else {
+        saveToHistory();
+        setInfLines([...infLines, { id: `L-${Date.now()}`, lat1: drawStartPoint.lat, lon1: drawStartPoint.lon, lat2: targetLat, lon2: targetLon, color: activeColor }]);
+        setDrawStartPoint(null);
+        setTool('SELECT');
+      }
+    } else if (tool === 'ANGLE') {
+      if (!angleVertexId) {
+        if (clickedPoint) {
+          setAngleVertexId(clickedPoint.id);
+        }
+      } else if (!angleLine1Id) {
+        // Find if clicked a line connected to vertex
+        const clickedLine = lines.find(line => {
+          if (line.fromId !== angleVertexId && line.toId !== angleVertexId) return false;
+          const p1 = allPoints.find(p => p.id === line.fromId);
+          const p2 = allPoints.find(p => p.id === line.toId);
+          if (!p1 || !p2) return false;
+          const xy1 = latLonToXY(p1.lat, p1.lon, canvas.width, canvas.height);
+          const xy2 = latLonToXY(p2.lat, p2.lon, canvas.width, canvas.height);
+          const A = x - xy1.x; const B = y - xy1.y; const C = xy2.x - xy1.x; const D = xy2.y - xy1.y;
+          const dot = A * C + B * D; const len_sq = C * C + D * D;
+          let param = -1; if (len_sq !== 0) param = dot / len_sq;
+          let xx, yy;
+          if (param < 0) { xx = xy1.x; yy = xy1.y; } else if (param > 1) { xx = xy2.x; yy = xy2.y; } else { xx = xy1.x + param * C; yy = xy1.y + param * D; }
+          const dx = x - xx; const dy = y - yy;
+          return Math.sqrt(dx*dx + dy*dy) < 15;
+        });
+        if (clickedLine) {
+          setAngleLine1Id(clickedLine.id);
+        }
+      } else {
+        // Select second line or North
+        const clickedLine = lines.find(line => {
+          if (line.fromId !== angleVertexId && line.toId !== angleVertexId) return false;
+          if (line.id === angleLine1Id) return false;
+          const p1 = allPoints.find(p => p.id === line.fromId);
+          const p2 = allPoints.find(p => p.id === line.toId);
+          if (!p1 || !p2) return false;
+          const xy1 = latLonToXY(p1.lat, p1.lon, canvas.width, canvas.height);
+          const xy2 = latLonToXY(p2.lat, p2.lon, canvas.width, canvas.height);
+          const A = x - xy1.x; const B = y - xy1.y; const C = xy2.x - xy1.x; const D = xy2.y - xy1.y;
+          const dot = A * C + B * D; const len_sq = C * C + D * D;
+          let param = -1; if (len_sq !== 0) param = dot / len_sq;
+          let xx, yy;
+          if (param < 0) { xx = xy1.x; yy = xy1.y; } else if (param > 1) { xx = xy2.x; yy = xy2.y; } else { xx = xy1.x + param * C; yy = xy1.y + param * D; }
+          const dx = x - xx; const dy = y - yy;
+          return Math.sqrt(dx*dx + dy*dy) < 15;
+        });
+
+        saveToHistory();
+        if (clickedLine) {
+          setAngleQuotations([...angleQuotations, { id: `AQ-${Date.now()}`, pointId: angleVertexId, line1Id: angleLine1Id, line2Id: clickedLine.id, color: activeColor }]);
+        } else {
+          // If clicked elsewhere (or vertex again), assume North
+          setAngleQuotations([...angleQuotations, { id: `AQ-${Date.now()}`, pointId: angleVertexId, line1Id: angleLine1Id, color: activeColor }]);
+        }
+        setAngleVertexId(null);
+        setAngleLine1Id(null);
+        setTool('SELECT');
+      }
+    }
+  };
+
+  const handleCommandSubmit = () => {
+    const input = commandBuffer.trim();
+    if (!input) return;
+
+    let targetLat = 0;
+    let targetLon = 0;
+    let valid = false;
+
+    // Try Absolute: lat,lon
+    const coordMatch = input.match(/^(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)$/);
+    if (coordMatch) {
+      targetLat = parseFloat(coordMatch[1]);
+      targetLon = parseFloat(coordMatch[2]);
+      valid = true;
+    } else {
+      // Try Relative: dist<brg
+      const vectorMatch = input.match(/^(\d+\.?\d*)\s*<\s*(\d+\.?\d*)$/);
+      if (vectorMatch) {
+        const dist = parseFloat(vectorMatch[1]);
+        const brng = parseFloat(vectorMatch[2]);
+        
+        let refPoint;
+
+        if (tool === 'LINE' && lineStartPoint) {
+           const p = points.find(x => x.id === lineStartPoint);
+           if (p) refPoint = p;
+        } else if (selectedPointIds.length > 0) {
+           const p = points.find(x => x.id === selectedPointIds[0]);
+           if (p) refPoint = p;
+        }
+
+        if (refPoint) {
+          const dest = calculateDestination(refPoint.lat, refPoint.lon, brng, dist);
+          targetLat = dest.lat;
+          targetLon = dest.lon;
+          valid = true;
+        } else {
+          alert('No reference point for relative coordinates. Select a point first.');
+          return;
+        }
+      }
+    }
+
+    if (valid) {
+      if (tool === 'CIRCLE') {
+        if (!drawStartPoint) {
+          setDrawStartPoint({ lat: targetLat, lon: targetLon });
+          setCommandBuffer('');
+          return;
+        } else {
+          const dist = calculateDistance(drawStartPoint.lat, drawStartPoint.lon, targetLat, targetLon);
+          saveToHistory();
+          setCircles([...circles, { id: `C-${Date.now()}`, lat: drawStartPoint.lat, lon: drawStartPoint.lon, radiusNm: dist, color: activeColor }]);
+          setDrawStartPoint(null);
+          setTool('SELECT');
+          setCommandBuffer('');
+          return;
+        }
+      } else if (tool === 'INF_LINE') {
+        if (!drawStartPoint) {
+          setDrawStartPoint({ lat: targetLat, lon: targetLon });
+          setCommandBuffer('');
+          return;
+        } else {
+          saveToHistory();
+          setInfLines([...infLines, { id: `L-${Date.now()}`, lat1: drawStartPoint.lat, lon1: drawStartPoint.lon, lat2: targetLat, lon2: targetLon, color: activeColor }]);
+          setDrawStartPoint(null);
+          setTool('SELECT');
+          setCommandBuffer('');
+          return;
+        }
+      }
+
+      saveToHistory();
+      const newName = `WP${points.length + 1}`;
+      const newPoint = { id: newName, name: newName, lat: targetLat, lon: targetLon, type: 'WAYPOINT' };
+      
+      setPoints(p => [...p, newPoint]);
+      setCenter({ lat: targetLat, lon: targetLon });
+      
+      if (tool === 'LINE') {
+         if (!lineStartPoint) {
+            setLineStartPoint(newName);
+         } else {
+            setLines(l => [...l, { 
+              id: `${lineStartPoint}-${newName}-${Date.now()}`, 
+              fromId: lineStartPoint, 
+              toId: newName,
+              color: activeColor,
+              tas: tas
+            }]);
+            setLineStartPoint(null);
+            setTool('SELECT');
+         }
+      }
+      setCommandBuffer('');
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full bg-zinc-50 text-zinc-900 font-sans select-none">
+      {/* Toolbar */}
+      <div className="no-print h-16 bg-white border-b border-zinc-200 flex items-center px-4 shadow-sm z-10 relative gap-4">
+        <div className="flex items-center gap-2 text-zinc-800 font-bold tracking-tight mr-4">
+          <Plane className="text-blue-600" size={24} />
+          <span className="text-lg">AeroCAD</span>
+        </div>
+        
+        <div className="h-10 w-px bg-zinc-200"></div>
+
+        {/* Tools */}
+        <div className="flex items-center gap-1">
+          {[
+            { id: 'SELECT', icon: MousePointer2, label: 'Select' },
+            { id: 'VOR', icon: Radio, label: 'VOR' },
+            { id: 'WAYPOINT', icon: MapPin, label: 'Waypoint' },
+            { id: 'LINE', icon: Route, label: 'Route' },
+            { id: 'PET', icon: GitCommitVertical, label: 'PET' },
+            { id: 'TURN', icon: RotateCw, label: 'Turn' },
+            { id: 'CIRCLE', icon: Circle, label: 'Circle' },
+            { id: 'INF_LINE', icon: Infinity, label: 'Inf Line' },
+            { id: 'ANGLE', icon: Scale, label: 'Angle' },
+          ].map(t => (
+            <button
+              key={t.id}
+              onClick={() => { setTool(t.id); setLineStartPoint(null); setDrawStartPoint(null); setTurnStart(null); setAngleVertexId(null); }}
+              className={`flex flex-col items-center justify-center w-14 h-12 rounded transition-all ${tool === t.id ? 'bg-blue-50 text-blue-600 border-blue-200 border shadow-sm' : 'text-zinc-500 hover:bg-zinc-50 border border-transparent'}`}
+              title={t.label}
+            >
+              <t.icon size={20} className={tool === t.id ? 'stroke-[2.5px]' : ''} />
+              <span className="text-[9px] mt-1 font-medium">{t.label}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="h-10 w-px bg-zinc-200 mx-2"></div>
+
+        {/* Colors */}
+        <div className="flex flex-col gap-1">
+           <div className="flex gap-1">
+            {COLORS.map(c => (
+              <button
+                key={c.value}
+                onClick={() => setActiveColor(c.value)}
+                className={`w-5 h-5 rounded-full border transition-transform ${activeColor === c.value ? 'scale-110 ring-2 ring-offset-1 ring-zinc-300 border-transparent' : 'border-zinc-200 hover:scale-110'}`}
+                style={{ backgroundColor: c.value }}
+                title={c.name}
+              />
+            ))}
+           </div>
+           <span className="text-[9px] text-zinc-400 font-medium text-center uppercase tracking-wider">Color</span>
+        </div>
+
+        <div className="h-10 w-px bg-zinc-200 mx-2"></div>
+
+        {/* Actions */}
+        <div className="flex items-center gap-1">
+           <button onClick={undo} disabled={undoStack.length === 0} className="p-2 text-zinc-500 hover:text-zinc-800 disabled:opacity-30 transition-colors" title="Undo (Ctrl+Z)">
+             <Undo size={18} />
+           </button>
+           <button onClick={redo} disabled={redoStack.length === 0} className="p-2 text-zinc-500 hover:text-zinc-800 disabled:opacity-30 transition-colors" title="Redo (Ctrl+Y)">
+             <Redo size={18} />
+           </button>
+           <button onClick={() => setShowClearConfirm(true)} className="p-2 text-red-500 hover:text-red-700 hover:bg-red-50 rounded transition-colors" title="Clear All">
+             <Trash2 size={18} />
+           </button>
+        </div>
+
+        <div className="h-10 w-px bg-zinc-200 mx-2"></div>
+          <div className="flex flex-col items-center border-r border-zinc-200 pr-4">
+            <div className="flex gap-1">
+              <button 
+                onClick={() => setZoom(z => z * 1.2)}
+                className="flex flex-col items-center justify-center w-12 h-12 rounded hover:bg-zinc-100 border border-transparent transition-colors"
+                title="Zoom In (+)"
+              >
+                <ZoomIn size={18} className="text-zinc-500" />
+                <span className="text-[10px] mt-1 text-zinc-600">In</span>
+              </button>
+              <button 
+                onClick={() => setZoom(z => z / 1.2)}
+                className="flex flex-col items-center justify-center w-12 h-12 rounded hover:bg-zinc-100 border border-transparent transition-colors"
+                title="Zoom Out (-)"
+              >
+                <ZoomOut size={18} className="text-zinc-500" />
+                <span className="text-[10px] mt-1 text-zinc-600">Out</span>
+              </button>
+            </div>
+            <span className="text-[10px] text-zinc-500 mt-1 uppercase tracking-wider font-medium">View</span>
+          </div>
+
+          <div className="flex flex-col items-center border-r border-zinc-200 pr-4 relative">
+            <div className="flex gap-1">
+              <button 
+                onClick={() => { setShowExportMenu(!showExportMenu); setShowNavMenu(false); }}
+                className={`flex flex-col items-center justify-center w-16 h-12 rounded transition-colors ${showExportMenu ? 'bg-zinc-100 border border-zinc-200' : 'hover:bg-zinc-100 border border-transparent'}`}
+                title="Output (O)"
+              >
+                <Printer size={20} className={showExportMenu ? 'text-zinc-800' : 'text-zinc-500'} />
+                <span className={`text-[10px] mt-1 ${showExportMenu ? 'text-zinc-800' : 'text-zinc-600'}`}>Output</span>
+              </button>
+            </div>
+            <span className="text-[10px] text-zinc-500 mt-1 uppercase tracking-wider font-medium">Export</span>
+
+            {showExportMenu && (
+              <div className="absolute top-full left-0 mt-2 bg-white border border-zinc-200 rounded-md shadow-xl p-2 z-50 w-32 flex flex-col gap-1">
+                <button 
+                  onClick={handlePrint}
+                  className="flex items-center gap-2 px-3 py-2 text-xs text-zinc-700 hover:bg-zinc-100 rounded w-full text-left"
+                >
+                  <Printer size={14} /> Print PDF
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Main Area */}
+      <div className="flex-1 relative flex flex-col">
+        {printImage && (
+          <img 
+            src={printImage} 
+            className="fixed inset-0 w-full h-full object-contain z-[10000] bg-white print-only" 
+            alt="Print Preview"
+          />
+        )}
+        {/* Canvas Container */}
+        <div 
+          ref={containerRef} 
+          className="flex-1 relative overflow-hidden canvas-container cursor-crosshair bg-zinc-50"
+        >
+          <canvas
+            ref={canvasRef}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseUp}
+            onWheel={handleWheel}
+            onClick={handleCanvasClick}
+            className="absolute top-0 left-0"
+          />
+        </div>
+      </div>
+
+      {/* Floating Command Input */}
+      {tool !== 'SELECT' && (
+        <div 
+          className="absolute pointer-events-none flex flex-col gap-1"
+          style={{ 
+            left: cursorScreenPos.x + 15, 
+            top: cursorScreenPos.y + 15,
+            zIndex: 100
+          }}
+        >
+          <div className="bg-white/90 border border-zinc-200 rounded-md px-3 py-2 shadow-xl backdrop-blur-md">
+            <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1 font-medium">
+              {tool === 'VOR' ? 'Specify VOR' : tool === 'WAYPOINT' ? 'Specify Waypoint' : tool === 'PET' ? (lineStartPoint ? 'End Point' : 'Start Point') : tool === 'TURN' ? (turnStart ? 'Specify Degrees (e.g. 45L)' : 'Start Point') : tool === 'ANGLE' ? (!angleVertexId ? 'Select Vertex' : !angleLine1Id ? 'Select Line 1' : 'Select Line 2 or Click Vertex for North') : (lineStartPoint ? 'Next Point' : 'Start Point')}
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-blue-600 font-mono text-xs">&gt;</span>
+              <span className="font-mono text-sm text-zinc-900 min-w-[100px] h-5 flex items-center">
+                {commandBuffer}<span className="animate-pulse ml-0.5 w-1.5 h-4 bg-blue-600 block"></span>
+              </span>
+            </div>
+            <div className="text-[9px] text-zinc-400 mt-1.5 font-mono">
+              {tool === 'TURN' && turnStart ? 'degrees[L/R]' : 'lat,lon OR dist<brg'}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear Confirmation Modal */}
+      {showClearConfirm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm">
+          <div className="bg-white rounded-lg shadow-xl border border-zinc-200 p-6 max-w-sm w-full mx-4">
+            <h3 className="text-lg font-semibold text-zinc-900 mb-2">Clear All Data?</h3>
+            <p className="text-sm text-zinc-600 mb-6">
+              This action will permanently delete all waypoints, routes, and PET markers. This cannot be undone.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button 
+                onClick={() => setShowClearConfirm(false)}
+                className="px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100 rounded-md transition-colors"
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={confirmClear}
+                className="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-md transition-colors shadow-sm"
+              >
+                Delete Everything
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Status Bar */}
+      <div className="no-print flex items-center justify-between px-4 py-1.5 bg-white border-t border-zinc-200 text-zinc-600 text-xs font-mono">
+        <div className="flex gap-6">
+          <span className="flex items-center gap-2"><WindIcon size={12} /> {wind.speed > 0 ? `${wind.direction}°/${wind.speed}kt` : 'CALM'}</span>
+          <span className="flex items-center gap-2"><Gauge size={12} /> {tas > 0 ? `${tas}kt` : '---'}</span>
+          <span className="flex items-center gap-2"><Clock size={12} /> {endurance}h</span>
+        </div>
+        <div className="flex items-center gap-2 text-zinc-500">
+          <Crosshair size={12} />
+          <span>{formatDMS(mousePos.lat, true)} {formatDMS(mousePos.lon, false)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <div className="flex flex-col h-screen overflow-hidden">
+      <div className="flex-1 relative">
+        <MapTab />
+      </div>
+    </div>
+  );
+}
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(
+            <React.StrictMode>
+                <App />
+            </React.StrictMode>
+        );
+    </script>
+</body>
+</html>
